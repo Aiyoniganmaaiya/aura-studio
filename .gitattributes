@@ -1,0 +1,11 @@
+# Normalize all text files to LF in the repo; check out as-is per OS rules below.
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF (cmd.exe misparses LF batch files)
+*.bat text eol=crlf
+
+# Binary assets
+*.png binary
+*.jpg binary
+*.ico binary
+*.icns binary

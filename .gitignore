@@ -1,0 +1,27 @@
+# Node / frontend build
+node_modules/
+dist/
+
+# Tauri / Rust build artifacts
+src-tauri/target/
+src-tauri/gen/schemas/
+# PyInstaller sidecar output (build_sidecar.py lands binaries here)
+src-tauri/binaries/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Claude Code local settings (per-machine permissions)
+.claude/settings.local.json
+
+# E2E test run artifacts — generated and re-read by scripts/e2e_modes_test.py
+e2e_*.png
+
+# OS / editor junk
+Thumbs.db
+desktop.ini
+.DS_Store
