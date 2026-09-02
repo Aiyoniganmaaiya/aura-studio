@@ -4,11 +4,9 @@
 > This is an early preview release. Expect bugs, incomplete features, and breaking changes. APIs, UI layout, and model support may change without notice. Please report issues and share feedback — it helps shape what Aura Studio becomes.
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![Status: Preview](https://img.shields.io/badge/status-预览-orange)](#warning-preview)
+[![Status: Preview](https://img.shields.io/badge/status-preview-orange)](#preview)
 
 Cross-platform AI Image Generation Studio — FLUX, SDXL and Stable Diffusion running entirely on your own machine. No accounts, no API keys, no uploads: your prompts never leave your computer.
-
-> **🧪 本项目当前为预览版本 (v0.1.0)** — 可能存在不稳定或未完成的功能，欢迎提交 Issue 和 PR。
 
 ## Features
 
