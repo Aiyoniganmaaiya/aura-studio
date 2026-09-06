@@ -1,6 +1,6 @@
 [package]
 name = "aura-studio"
-version = "0.1.0"
+version = "0.2.0-preview"
 description = "Aura Studio - AI Image Generation Studio"
 authors = ["Aura Studio"]
 edition = "2021"

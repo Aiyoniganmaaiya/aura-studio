@@ -1,7 +1,7 @@
 {
   "name": "aura-studio",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0-preview",
   "license": "Apache-2.0",
   "description": "Aura Studio - Cross-platform AI Image Generation Studio",
   "type": "module",

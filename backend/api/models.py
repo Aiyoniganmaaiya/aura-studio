@@ -202,9 +202,13 @@ class ModelManager:
         return None
 
     def delete_model(self, model_id: str) -> bool:
-        """Delete a downloaded model's local files. Returns True if deleted."""
+        """Delete a downloaded model's local files. Returns True if deleted.
+
+        Also covers the ControlNet dir — its weights are downloaded to
+        models/controlnet and would otherwise be impossible to remove.
+        """
         deleted = False
-        for base in (self.cache_dir, self.custom_dir):
+        for base in (self.cache_dir, self.custom_dir, self.controlnet_dir):
             path = os.path.join(base, self._safe_name(model_id))
             if os.path.isdir(path):
                 shutil.rmtree(path, ignore_errors=True)
@@ -324,11 +328,12 @@ class ModelManager:
                 return _ReportingTqdm
 
             pattern_kwargs = {"allow_patterns": [file_pattern]} if file_pattern else {}
-            # Networks reset mid-download (WinError 10054/10038 on some
-            # proxies/CDNs); huggingface_hub retries single HEAD requests but
-            # NOT an interrupted snapshot. snapshot_download resumes into the
-            # same directory, so retry the whole snapshot a few times.
-            max_attempts = 3
+            # Networks here reset mid-download and can stay down for minutes
+            # (WinError 10054/10038 on some proxies/CDNs); huggingface_hub
+            # retries single HEAD requests but NOT an interrupted snapshot.
+            # snapshot_download resumes into the same directory, so retry the
+            # whole snapshot with growing backoff before reporting failure.
+            max_attempts = 8
             for attempt in range(1, max_attempts + 1):
                 try:
                     snapshot_download(
@@ -344,9 +349,10 @@ class ModelManager:
                 except Exception as e:
                     if attempt == max_attempts:
                         raise
+                    wait = min(60, 5 * attempt)
                     print(f"[Aura] Download interrupted (attempt {attempt}/{max_attempts}): {e}")
-                    print("[Aura] Retrying — snapshot_download resumes where it left off")
-                    time.sleep(3 * attempt)
+                    print(f"[Aura] Retrying in {wait}s — snapshot_download resumes where it left off")
+                    time.sleep(wait)
 
             with self._tasks_lock:
                 started_at = self._download_tasks[task_id]["started_at"]

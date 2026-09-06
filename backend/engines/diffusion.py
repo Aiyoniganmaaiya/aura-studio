@@ -10,6 +10,7 @@ import secrets
 import struct
 import threading
 import time
+import traceback
 from typing import Callable, Optional
 
 import torch
@@ -88,6 +89,17 @@ except ImportError:
 # its z-image checkpoint converter to restore the missing batch dimension fixes
 # such exports without touching correctly shaped ones (e.g. unsloth).
 _ZIMAGE_PAD_TOKEN_KEYS = ("x_pad_token", "cap_pad_token", "siglip_pad_token")
+
+# transformers 5.x materializes model tensors through a ThreadPoolExecutor
+# (GLOBAL_WORKERS) whose native mmap copies segfault intermittently on Windows
+# (hard crash of the whole engine, mid text-encoder load). Reads happen at
+# load time, so pinning it to 1 here makes materialization single-threaded —
+# marginally slower, reliably stable.
+try:
+    from transformers import core_model_loading as _core_model_loading
+    _core_model_loading.GLOBAL_WORKERS = 1
+except Exception:
+    pass
 
 
 def _install_zimage_gguf_pad_token_fix() -> None:
@@ -177,6 +189,12 @@ KNOWN_MODEL_TYPES = ("sd15", "sd21", "sdxl", "flux", "z-image")
 # official base's text encoder / VAE / scheduler architecture.
 GGUF_BASE_REPO_MAP = {
     "unsloth/Z-Image-Turbo-GGUF": "Tongyi-MAI/Z-Image-Turbo",
+    # GGUF-only repos: the suffix strip would produce an org/repo that has
+    # never existed (city96 publishes no unquantized pipeline repo). Point at
+    # unsloth's ungated rehost — black-forest-labs/FLUX.1-* now require auth
+    # for file downloads (401 anonymously), which would brick first-load.
+    "city96/FLUX.1-schnell-gguf": "unsloth/FLUX.1-schnell",
+    "city96/FLUX.1-dev-gguf": "black-forest-labs/FLUX.1-dev",
 }
 
 GGUF_FAMILY_BASE = {
@@ -492,11 +510,13 @@ class DiffusionEngine:
                 last_error = e
         raise last_error  # type: ignore[misc]
 
-    def _apply_device_strategy(self, pipe, model_type: str):
+    def _apply_device_strategy(self, pipe, model_type: str, gguf: bool = False):
         """Place the pipeline on the best available device/memory config.
 
         If the GPU has enough free VRAM, keep everything on-device (fast).
         Otherwise fall back to accelerate's cpu offload instead of OOM-ing.
+        `gguf` marks pipelines whose transformer holds GGUF-quantized params
+        (they cannot go through accelerate's sequential-offload meta init).
         """
         if self.device != "cuda":
             pipe.to("cpu")
@@ -517,6 +537,41 @@ class DiffusionEngine:
                 pipe.enable_attention_slicing()
             print(f"[Aura] Model on cuda ({free_gb:.1f} GB free >= {need_gb} GB needed)")
         else:
+            if (gguf and model_type == "flux"
+                    and getattr(pipe, "text_encoder", None) is not None):
+                # FLUX GGUF on small cards (covers FLUX.1 and FLUX.2 alike).
+                # Sequential (op-level) offload cannot run at all —
+                # accelerate's meta-device init chokes on diffusers' GGUF
+                # parameter type (KeyError: None) — while model-level offload
+                # OOMs: the multi-GB text encoder stays resident while the
+                # quantized transformer comes up. Split the difference:
+                # keep the transformer+VAE resident on the GPU and stream the
+                # text encoder layer by layer via accelerate's per-module
+                # cpu_offload.
+                try:
+                    from accelerate import cpu_offload as _accel_cpu_offload
+                    pipe.transformer.to(self.device)
+                    if getattr(pipe, "vae", None) is not None:
+                        pipe.vae.to(self.device)
+                    # Flux-family pipelines carry TWO text encoders (CLIP +
+                    # T5-XXL for FLUX.1, a single Mistral for FLUX.2) — every
+                    # one of them must be hooked, or an unhooked encoder stays
+                    # on CPU while the pipeline feeds it CUDA inputs.
+                    offloaded = []
+                    for enc_name in ("text_encoder", "text_encoder_2"):
+                        enc = getattr(pipe, enc_name, None)
+                        if enc is not None:
+                            _accel_cpu_offload(enc, execution_device=torch.device(self.device))
+                            offloaded.append(enc_name)
+                    print(f"[Aura] FLUX GGUF: transformer+VAE resident on GPU, "
+                          f"{', '.join(offloaded)} layer-offloaded ({free_gb:.1f} GB free)")
+                    return
+                except Exception as inner:
+                    print(f"[Aura] FLUX.2 GGUF hybrid placement failed "
+                          f"({type(inner).__name__}: {inner}); falling back")
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
             if hasattr(pipe, "enable_model_cpu_offload"):
                 pipe.enable_model_cpu_offload()  # moves weights itself
                 print(f"[Aura] Only {free_gb:.1f} GB free (< {need_gb} GB needed); using cpu offload")
@@ -555,7 +610,7 @@ class DiffusionEngine:
                             "for instead."
                         )
                     pipe = self._load_pipeline(source, mt)
-                self._apply_device_strategy(pipe, mt)
+                self._apply_device_strategy(pipe, mt, gguf=gguf_file is not None)
 
                 self.pipeline = pipe
                 self.model_id = model_id
@@ -570,7 +625,15 @@ class DiffusionEngine:
             except Exception as e:
                 self.pipeline = None
                 self.loaded = False
-                print(f"[Aura] Failed to load model {model_id}: {e}")
+                # A failed load can leave half-moved weights on the GPU (they
+                # are only garbage-collected lazily); release them so the next
+                # attempt — possibly a smaller model — is not OOM-ed by a
+                # ghost of the failed one.
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(f"[Aura] Failed to load model {model_id}: {type(e).__name__}: {e}")
+                traceback.print_exc()
                 raise
 
     # ── Image modes (img2img / inpaint) ──────────────────────────────
@@ -662,17 +725,23 @@ class DiffusionEngine:
         try:
             if mt in ("sd15", "sd21"):
                 if mode == "img2img":
-                    # Legacy classes take safety kwargs; keep them quiet.
+                    # Legacy classes take safety kwargs; keep them quiet. The
+                    # two safety fields are REQUIRED constructor args but the
+                    # txt2img pipeline was loaded with safety_checker=None, so
+                    # they never appear in comps — pass them explicitly.
                     pipe = StableDiffusionImg2ImgPipeline(
-                        **comps, requires_safety_checker=False
+                        **comps, safety_checker=None, feature_extractor=None,
+                        requires_safety_checker=False,
                     )
                 elif mode == "inpaint":  # legacy: regular 4-channel unet + mask concat
                     pipe = StableDiffusionInpaintPipelineLegacy(
-                        **comps, requires_safety_checker=False
+                        **comps, safety_checker=None, feature_extractor=None,
+                        requires_safety_checker=False,
                     )
                 else:  # controlnet
                     pipe = StableDiffusionControlNetPipeline(
-                        **comps, controlnet=controlnet, requires_safety_checker=False
+                        **comps, controlnet=controlnet, safety_checker=None,
+                        feature_extractor=None, requires_safety_checker=False,
                     )
             elif mt == "sdxl":
                 if mode == "img2img":
@@ -904,6 +973,13 @@ class DiffusionEngine:
         if model_type == "z-image":
             kwargs["num_inference_steps"] = min(num_inference_steps, 8)
             kwargs["guidance_scale"] = 0.0
+
+        # The legacy SD inpaint class has no width/height args — it takes the
+        # canvas from the init image + mask, which _generate_locked already
+        # resized to the requested (aligned) size.
+        if model_type in ("sd15", "sd21") and mode == "inpaint":
+            kwargs.pop("width", None)
+            kwargs.pop("height", None)
 
         result = pipe(**kwargs)
         image = result.images[0]

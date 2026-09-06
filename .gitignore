@@ -25,3 +25,6 @@ e2e_*.png
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# Local agent-session artifacts
+.omo/
